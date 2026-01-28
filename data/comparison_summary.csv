@@ -1,0 +1,9 @@
+Aspect,Self-Training,Co-Training
+Test Accuracy,0.5890,0.5079
+Test F1-Macro,0.5343,0.3655
+Validation Peak Acc,0.7226,0.7302
+Total Pseudo-Labels,350019,5000
+Training Method,Single model,Ensemble (2 models)
+Complexity,Low ✓,Medium
+Interpretability,High ✓,Medium
+Recommended?,✓ If co-training ≤ self-training,✓ If co-training > self-training

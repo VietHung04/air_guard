@@ -523,6 +523,207 @@ class CoTrainingAQIClassifier:
         return np.array(AQI_CLASSES, dtype=object)[p.argmax(axis=1)]
 
 
+# Extended co-training with per-model tracking
+class DetailedCoTrainingAQIClassifier:
+    """
+    Two-view co-training with detailed per-model tracking:
+      - track each model's validation accuracy separately
+      - track number of samples added by each model per iteration
+      - analyze agreement/disagreement between models
+    """
+
+    def __init__(
+        self,
+        data_cfg: SemiDataConfig,
+        ct_cfg: CoTrainingConfig,
+        view1_cols: Optional[List[str]] = None,
+        view2_cols: Optional[List[str]] = None,
+    ):
+        self.data_cfg = data_cfg
+        self.ct_cfg = ct_cfg
+        self.view1_cols = view1_cols
+        self.view2_cols = view2_cols
+
+        self.model1_: Optional[Pipeline] = None
+        self.model2_: Optional[Pipeline] = None
+        self.info_: Dict = {}
+        self.history_: List[Dict] = []
+
+    def fit(self, df: pd.DataFrame) -> "DetailedCoTrainingAQIClassifier":
+        df = df.copy()
+        train_df, _ = time_split(df, cutoff=self.data_cfg.cutoff)
+
+        feat_cols = build_feature_columns(train_df, self.data_cfg)
+        v1, v2 = make_default_views(feat_cols)
+        if self.view1_cols is not None:
+            v1 = list(self.view1_cols)
+        if self.view2_cols is not None:
+            v2 = list(self.view2_cols)
+
+        X1_all = _normalize_missing(train_df[v1].copy())
+        X2_all = _normalize_missing(train_df[v2].copy())
+        y_all = train_df[self.data_cfg.target_col].astype("object")
+
+        fit_idx, val_idx = _split_train_val_labeled(train_df, self.data_cfg, self.ct_cfg.val_frac)
+        unlabeled_idx = train_df.index[pd.isna(y_all)].to_numpy()
+
+        pipe1, info1 = make_pipeline(X1_all, random_state=self.data_cfg.random_state)
+        pipe2, info2 = make_pipeline(X2_all, random_state=self.data_cfg.random_state)
+
+        self.info_ = {
+            "view1_cols": v1,
+            "view2_cols": v2,
+            "view1_numeric_cols": info1["numeric_cols"],
+            "view1_categorical_cols": info1["categorical_cols"],
+            "view2_numeric_cols": info2["numeric_cols"],
+            "view2_categorical_cols": info2["categorical_cols"],
+        }
+
+        y_work = y_all.copy()
+
+        for it in range(1, self.ct_cfg.max_iter + 1):
+            pipe1.fit(X1_all.loc[fit_idx], y_work.loc[fit_idx])
+            pipe2.fit(X2_all.loc[fit_idx], y_work.loc[fit_idx])
+
+            # validation: individual & ensemble
+            p1_val_raw = pipe1.predict_proba(X1_all.loc[val_idx])
+            p2_val_raw = pipe2.predict_proba(X2_all.loc[val_idx])
+            p1_val = _align_proba_to_labels(p1_val_raw, pipe1.named_steps["model"].classes_, AQI_CLASSES)
+            p2_val = _align_proba_to_labels(p2_val_raw, pipe2.named_steps["model"].classes_, AQI_CLASSES)
+
+            y_val_true = y_all.loc[val_idx]
+            y1_val_pred = np.array(AQI_CLASSES, dtype=object)[p1_val.argmax(axis=1)]
+            y2_val_pred = np.array(AQI_CLASSES, dtype=object)[p2_val.argmax(axis=1)]
+
+            val_acc1 = float(accuracy_score(y_val_true, y1_val_pred))
+            val_acc2 = float(accuracy_score(y_val_true, y2_val_pred))
+            val_f1_1 = float(f1_score(y_val_true, y1_val_pred, average="macro"))
+            val_f1_2 = float(f1_score(y_val_true, y2_val_pred, average="macro"))
+
+            # ensemble
+            p_avg = (p1_val + p2_val) / 2.0
+            y_avg_pred = np.array(AQI_CLASSES, dtype=object)[p_avg.argmax(axis=1)]
+            val_acc_avg = float(accuracy_score(y_val_true, y_avg_pred))
+
+            if unlabeled_idx.size == 0:
+                self.history_.append({
+                    "iter": it,
+                    "model1_val_acc": val_acc1,
+                    "model2_val_acc": val_acc2,
+                    "ensemble_val_acc": val_acc_avg,
+                    "model1_val_f1": val_f1_1,
+                    "model2_val_f1": val_f1_2,
+                    "unlabeled_pool": 0,
+                    "new_by_model1": 0,
+                    "new_by_model2": 0,
+                    "agreement": 0,
+                    "disagreement": 0,
+                    "tau": float(self.ct_cfg.tau),
+                })
+                break
+
+            # pseudo-label proposals
+            p1_u_raw = pipe1.predict_proba(X1_all.loc[unlabeled_idx])
+            p2_u_raw = pipe2.predict_proba(X2_all.loc[unlabeled_idx])
+            p1_u = _align_proba_to_labels(p1_u_raw, pipe1.named_steps["model"].classes_, AQI_CLASSES)
+            p2_u = _align_proba_to_labels(p2_u_raw, pipe2.named_steps["model"].classes_, AQI_CLASSES)
+
+            max1 = p1_u.max(axis=1)
+            max2 = p2_u.max(axis=1)
+            y1_u = np.array(AQI_CLASSES, dtype=object)[p1_u.argmax(axis=1)]
+            y2_u = np.array(AQI_CLASSES, dtype=object)[p2_u.argmax(axis=1)]
+
+            cand1 = unlabeled_idx[max1 >= float(self.ct_cfg.tau)]
+            cand2 = unlabeled_idx[max2 >= float(self.ct_cfg.tau)]
+            
+            # Track which samples are selected by which model
+            model1_only = set(cand1.tolist()) - set(cand2.tolist())
+            model2_only = set(cand2.tolist()) - set(cand1.tolist())
+            both_agree = set(cand1.tolist()) & set(cand2.tolist())
+
+            picked = np.unique(np.concatenate([cand1, cand2]))
+
+            if picked.size > int(self.ct_cfg.max_new_per_iter):
+                rng = np.random.default_rng(self.data_cfg.random_state + it)
+                picked = rng.choice(picked, size=int(self.ct_cfg.max_new_per_iter), replace=False)
+
+            n_new = int(picked.size)
+            n_agree = int(len([p for p in picked if int(p) in both_agree]))
+            n_disagree = int(n_new - n_agree)
+
+            self.history_.append({
+                "iter": it,
+                "model1_val_acc": val_acc1,
+                "model2_val_acc": val_acc2,
+                "ensemble_val_acc": val_acc_avg,
+                "model1_val_f1": val_f1_1,
+                "model2_val_f1": val_f1_2,
+                "unlabeled_pool": int(unlabeled_idx.size),
+                "new_by_model1": int(len([p for p in picked if int(p) in model1_only])),
+                "new_by_model2": int(len([p for p in picked if int(p) in model2_only])),
+                "agreement": n_agree,
+                "disagreement": n_disagree,
+                "tau": float(self.ct_cfg.tau),
+            })
+
+            if n_new < int(self.ct_cfg.min_new_per_iter):
+                break
+
+            idx_to_pos = {int(idx): pos for pos, idx in enumerate(unlabeled_idx)}
+            new_labels: Dict[int, str] = {}
+            for idx in picked:
+                idx_i = int(idx)
+                pos = idx_to_pos[idx_i]
+                if y1_u[pos] == y2_u[pos]:
+                    new_labels[idx_i] = str(y1_u[pos])
+                else:
+                    new_labels[idx_i] = str(y1_u[pos] if max1[pos] >= max2[pos] else y2_u[pos])
+
+            y_work.loc[list(new_labels.keys())] = list(new_labels.values())
+            fit_idx = np.unique(np.concatenate([fit_idx, np.array(list(new_labels.keys()), dtype=int)]))
+
+            picked_set = set(new_labels.keys())
+            unlabeled_idx = np.array([i for i in unlabeled_idx if int(i) not in picked_set], dtype=int)
+
+        self.model1_ = pipe1
+        self.model2_ = pipe2
+        return self
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        if self.model1_ is None or self.model2_ is None:
+            raise RuntimeError("Models are not fitted yet.")
+
+        v1 = self.info_["view1_cols"]
+        v2 = self.info_["view2_cols"]
+        X1 = _normalize_missing(df[v1].copy())
+        X2 = _normalize_missing(df[v2].copy())
+
+        p1_raw = self.model1_.predict_proba(X1)
+        p2_raw = self.model2_.predict_proba(X2)
+        p1 = _align_proba_to_labels(p1_raw, self.model1_.named_steps["model"].classes_, AQI_CLASSES)
+        p2 = _align_proba_to_labels(p2_raw, self.model2_.named_steps["model"].classes_, AQI_CLASSES)
+
+        p = (p1 + p2) / 2.0
+        return np.array(AQI_CLASSES, dtype=object)[p.argmax(axis=1)]
+
+    def predict_proba_individual(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (proba1, proba2) from both models."""
+        if self.model1_ is None or self.model2_ is None:
+            raise RuntimeError("Models are not fitted yet.")
+
+        v1 = self.info_["view1_cols"]
+        v2 = self.info_["view2_cols"]
+        X1 = _normalize_missing(df[v1].copy())
+        X2 = _normalize_missing(df[v2].copy())
+
+        p1_raw = self.model1_.predict_proba(X1)
+        p2_raw = self.model2_.predict_proba(X2)
+        p1 = _align_proba_to_labels(p1_raw, self.model1_.named_steps["model"].classes_, AQI_CLASSES)
+        p2 = _align_proba_to_labels(p2_raw, self.model2_.named_steps["model"].classes_, AQI_CLASSES)
+
+        return p1, p2
+
+
 def run_co_training(
     df: pd.DataFrame,
     data_cfg: SemiDataConfig,
@@ -572,4 +773,60 @@ def run_co_training(
         "test_metrics": test_metrics,
         "pred_df": pred_df,
         "model_info": ct.info_,
+    }
+
+
+def run_detailed_co_training(
+    df: pd.DataFrame,
+    data_cfg: SemiDataConfig,
+    ct_cfg: CoTrainingConfig,
+    view1_cols: Optional[List[str]] = None,
+    view2_cols: Optional[List[str]] = None,
+) -> Dict:
+    """Run co-training with detailed per-model tracking."""
+    ct = DetailedCoTrainingAQIClassifier(
+        data_cfg=data_cfg,
+        ct_cfg=ct_cfg,
+        view1_cols=view1_cols,
+        view2_cols=view2_cols,
+    ).fit(df)
+
+    _, test_df = time_split(df.copy(), cutoff=data_cfg.cutoff)
+    y_test = test_df[data_cfg.target_col].astype("object")
+    mask = pd.notna(y_test)
+
+    test_labeled = test_df.loc[mask].copy()
+    y_pred = ct.predict(test_labeled)
+    p1_test, p2_test = ct.predict_proba_individual(test_labeled)
+
+    pred_df = pd.DataFrame({
+        "datetime": test_labeled["datetime"].values,
+        "station": test_labeled["station"].values if "station" in test_labeled.columns else None,
+        "y_true": y_test.loc[mask].values,
+        "y_pred": y_pred,
+    })
+
+    test_metrics = {
+        "cutoff": str(test_df["datetime"].min()),
+        "n_train": int((test_df["datetime"] < pd.Timestamp(data_cfg.cutoff)).sum()),
+        "n_test": int(mask.sum()),
+        "accuracy": float(accuracy_score(y_test.loc[mask], y_pred)),
+        "f1_macro": float(f1_score(y_test.loc[mask], y_pred, average="macro")),
+        "report": classification_report(y_test.loc[mask], y_pred, output_dict=True),
+        "confusion_matrix": confusion_matrix(y_test.loc[mask], y_pred, labels=AQI_CLASSES).tolist(),
+        "labels": AQI_CLASSES,
+        "feature_cols": list(ct.info_.get("view1_cols", [])) + list(ct.info_.get("view2_cols", [])),
+        "categorical_cols": [],
+        "numeric_cols": [],
+    }
+
+    return {
+        "model1": ct.model1_,
+        "model2": ct.model2_,
+        "history": ct.history_,
+        "test_metrics": test_metrics,
+        "pred_df": pred_df,
+        "model_info": ct.info_,
+        "p1_test": p1_test,
+        "p2_test": p2_test,
     }
